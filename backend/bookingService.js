@@ -32,6 +32,9 @@ const ADMIN_PHONES = (process.env.ADMIN_PHONES || '')
   .filter(Boolean)
   .map(normalizePhone);
 
+const ADMIN_REPLY_TTL_MS = 24 * 60 * 60 * 1000;
+const adminReplyTargets = new Map();
+
 const GLOBAL_MENU_COMMANDS = ['меню', 'menu', 'старт', 'start', 'главное меню', 'в меню'];
 const HELP_COMMANDS = ['помощь', 'help', '?'];
 
@@ -59,6 +62,50 @@ function resetSession(phone) {
 function matchesChoice(text, options) {
   const normalized = text.trim().toLowerCase();
   return options.some((option) => normalized === option.toLowerCase());
+}
+
+function isAdminPhone(phone) {
+  return ADMIN_PHONES.includes(normalizePhone(phone));
+}
+
+function pruneAdminReplyTargets() {
+  const now = Date.now();
+
+  for (const [messageId, target] of adminReplyTargets.entries()) {
+    if (now - target.createdAt > ADMIN_REPLY_TTL_MS) {
+      adminReplyTargets.delete(messageId);
+    }
+  }
+}
+
+function trackAdminReplyTarget(messageId, clientPhone, flow) {
+  if (!messageId) return;
+
+  adminReplyTargets.set(messageId, {
+    clientPhone: normalizePhone(clientPhone),
+    flow,
+    createdAt: Date.now(),
+  });
+
+  pruneAdminReplyTargets();
+}
+
+function getAdminReplyTarget(messageId) {
+  if (!messageId) return null;
+
+  const target = adminReplyTargets.get(messageId);
+  if (!target) return null;
+
+  if (Date.now() - target.createdAt > ADMIN_REPLY_TTL_MS) {
+    adminReplyTargets.delete(messageId);
+    return null;
+  }
+
+  return target;
+}
+
+function formatBarberReply(text) {
+  return `💈 Ответ барбера:\n\n${text}`;
 }
 
 // ---------- formatting helpers ----------
@@ -148,7 +195,7 @@ function buildHelpMessage() {
 • «Записаться» — выбрать услугу, день и время
 • «Мои записи» — посмотреть, перенести или отменить запись
 
-✍️ Вы можете написать сообщение администратору напрямую. Напишите ваш вопрос или сообщение прямо сейчас (или отправьте «0» для возврата в меню):`;
+✍️ Напишите ваш вопрос или сообщение прямо сейчас. Барбер ответит вам прямо в этом чате (или отправьте «0» для возврата в меню):`;
 }
 
 function formatServicesList(allServices) {
@@ -770,10 +817,19 @@ async function handleHelpMessageSubmit(phone, session, text, customer) {
 Текст:
 ${text}`;
 
-  await notifyAdmins(adminMsg);
+  await Promise.all(
+    ADMIN_PHONES.map(async (adminPhone) => {
+      try {
+        const result = await sendTextMessage(adminPhone, adminMsg);
+        trackAdminReplyTarget(extractSentMessageId(result), phone, 'help');
+      } catch (err) {
+        console.error(`Failed to notify admin ${adminPhone}:`, err.message);
+      }
+    })
+  );
 
   resetSession(phone);
-  return `✅ Ваше сообщение успешно отправлено администратору. Мы свяжемся с вами в ближайшее время!\n\n${buildMenuMessage()}`;
+  return `✅ Ваше сообщение отправлено барберу. Ответ придёт прямо в этот чат.\n\n${buildMenuMessage()}`;
 }
 
 // ---------- flow: photo review ----------
@@ -827,9 +883,14 @@ async function handlePhotoReference(phone, session, customer, mediaId, mimeType)
       await Promise.all(
         ADMIN_PHONES.map(async (adminPhone) => {
           try {
-            await sendTextMessage(adminPhone, intro);
-            await sendImageMessage(adminPhone, selfieNewId, '🧑 Фото клиента');
-            await sendImageMessage(adminPhone, refNewId, '💇 Референс');
+            const introResult = await sendTextMessage(adminPhone, intro);
+            trackAdminReplyTarget(extractSentMessageId(introResult), phone, 'photo_review');
+
+            const selfieResult = await sendImageMessage(adminPhone, selfieNewId, '🧑 Фото клиента');
+            trackAdminReplyTarget(extractSentMessageId(selfieResult), phone, 'photo_review');
+
+            const refResult = await sendImageMessage(adminPhone, refNewId, '💇 Референс');
+            trackAdminReplyTarget(extractSentMessageId(refResult), phone, 'photo_review');
           } catch (err) {
             console.error(`[PhotoReview] Failed to notify admin ${adminPhone}:`, err.message);
           }
@@ -842,18 +903,65 @@ async function handlePhotoReference(phone, session, customer, mediaId, mimeType)
 
   return `✅ Оба фото отправлены барберу!
 
-Мастер рассмотрит ваши фото и отпишет вам напрямую — ожидайте ответа в ближайшее время.
+Мастер рассмотрит ваши фото и ответит вам прямо в этом чате — ожидайте ответа в ближайшее время.
 
 ${buildMenuMessage()}`;
 }
 
 // ---------- main dispatcher ----------
 
-async function handleIncomingMessage({ phone, text, contactName, mediaId = null, mimeType = null }) {
-  const customer = await getOrCreateCustomer(phone, contactName);
-  const session = getSession(phone);
+async function handleIncomingMessage({
+  phone,
+  text,
+  contactName,
+  mediaId = null,
+  mimeType = null,
+  messageId = null,
+  replyToMessageId = null,
+}) {
   const trimmed = (text || '').trim();
   const lower = trimmed.toLowerCase();
+  const normalizedPhone = normalizePhone(phone);
+
+  if (isAdminPhone(normalizedPhone)) {
+    if (!replyToMessageId) {
+      console.log(`[AdminRelay] Ignored non-reply admin message from ${normalizedPhone}`);
+      return null;
+    }
+
+    const target = getAdminReplyTarget(replyToMessageId);
+
+    if (!target) {
+      console.warn(
+        `[AdminRelay] No tracked client found for admin reply ${normalizedPhone} -> ${replyToMessageId}`
+      );
+      return null;
+    }
+
+    if (!trimmed) {
+      console.warn(
+        `[AdminRelay] Empty admin reply ignored for ${normalizedPhone} -> ${replyToMessageId}`
+      );
+      return null;
+    }
+
+    try {
+      await sendTextMessage(target.clientPhone, formatBarberReply(trimmed));
+      console.log(
+        `[AdminRelay] Relayed admin reply from ${normalizedPhone} to ${target.clientPhone}`
+      );
+    } catch (err) {
+      console.error(
+        `[AdminRelay] Failed to relay admin reply from ${normalizedPhone} to ${target.clientPhone}:`,
+        err.message
+      );
+    }
+
+    return null;
+  }
+
+  const customer = await getOrCreateCustomer(phone, contactName);
+  const session = getSession(phone);
 
   if (GLOBAL_MENU_COMMANDS.includes(lower)) {
     resetSession(phone);

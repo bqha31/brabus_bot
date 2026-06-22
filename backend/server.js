@@ -53,6 +53,8 @@ app.post('/webhook', async (req, res) => {
         contactName: message.contactName,
         mediaId: message.mediaId || null,
         mimeType: message.mimeType || null,
+        messageId: message.messageId || null,
+        replyToMessageId: message.replyToMessageId || null,
       });
 
       if (reply) {

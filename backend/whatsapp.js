@@ -191,6 +191,7 @@ function extractIncomingMessages(body) {
         const base = {
           from: message.from,
           messageId: message.id,
+          replyToMessageId: message.context?.id || message.context?.message_id || null,
           contactName: contact?.profile?.name || null,
           type: message.type,
         };
