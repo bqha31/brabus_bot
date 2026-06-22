@@ -34,6 +34,8 @@ const ADMIN_PHONES = (process.env.ADMIN_PHONES || '')
 
 const ADMIN_REPLY_TTL_MS = 24 * 60 * 60 * 1000;
 const adminReplyTargets = new Map();
+const CLIENT_REPLY_TTL_MS = 24 * 60 * 60 * 1000;
+const clientReplyTargets = new Map();
 
 const GLOBAL_MENU_COMMANDS = ['меню', 'menu', 'старт', 'start', 'главное меню', 'в меню'];
 const HELP_COMMANDS = ['помощь', 'help', '?'];
@@ -104,8 +106,82 @@ function getAdminReplyTarget(messageId) {
   return target;
 }
 
+function trackClientReplyTarget(messageId, clientPhone, action) {
+  if (!messageId) return;
+
+  clientReplyTargets.set(messageId, {
+    clientPhone: normalizePhone(clientPhone),
+    action,
+    createdAt: Date.now(),
+  });
+
+  const now = Date.now();
+  for (const [id, target] of clientReplyTargets.entries()) {
+    if (now - target.createdAt > CLIENT_REPLY_TTL_MS) {
+      clientReplyTargets.delete(id);
+    }
+  }
+}
+
+function getClientReplyTarget(messageId) {
+  if (!messageId) return null;
+
+  const target = clientReplyTargets.get(messageId);
+  if (!target) return null;
+
+  if (Date.now() - target.createdAt > CLIENT_REPLY_TTL_MS) {
+    clientReplyTargets.delete(messageId);
+    return null;
+  }
+
+  return target;
+}
+
 function formatBarberReply(text) {
   return `💈 Ответ барбера:\n\n${text}`;
+}
+
+function isAffirmativeReply(text) {
+  return matchesChoice(text, [
+    'да',
+    'ага',
+    'ок',
+    'окей',
+    'хорошо',
+    'конечно',
+    'давай',
+    'показать свободное время',
+    'покажи свободное время',
+    'покажи время',
+    'покажи',
+    'свободное время',
+    'записаться',
+  ]);
+}
+
+function isNegativeReply(text) {
+  return matchesChoice(text, ['нет', 'не надо', 'потом', 'позже']);
+}
+
+function formatPhotoReviewApprovalPrompt() {
+  return `Мы можем сделать такую стрижку ✅
+Хотите записаться?`;
+}
+
+function formatCancelRecoveryPrompt() {
+  return `Запись отменена.
+Хотите подобрать другое удобное время?`;
+}
+
+function formatFollowUpPrompt() {
+  return `Пора обновить стрижку ✂️
+Показать свободное время?`;
+}
+
+async function sendTrackedClientPrompt(phone, text, action) {
+  const result = await sendTextMessage(phone, text);
+  trackClientReplyTarget(extractSentMessageId(result), phone, action);
+  return result;
 }
 
 // ---------- formatting helpers ----------
@@ -733,7 +809,8 @@ async function handleCancelConfirmChoice(phone, session, text) {
       `❌ Отмена записи\nУслуга: ${booking.service?.name || ''}\nВремя: ${formatDateTimeFull(booking.booking_time)}`
     );
 
-    return `Запись отменена.\n\n${buildMenuMessage()}`;
+    await sendTrackedClientPrompt(phone, formatCancelRecoveryPrompt(), 'book_appointment');
+    return null;
   }
 
   return `Пожалуйста, ответьте «Да» или «Нет».\n\n${formatCancelConfirm(session.selectedBooking)}`;
@@ -864,7 +941,9 @@ async function handlePhotoReference(phone, session, customer, mediaId, mimeType)
   const selfieId = session.selfieMediaId;
   const selfMime = session.selfieMediaMime || 'image/jpeg';
   const refMime = mimeType || 'image/jpeg';
-  const nameLabel = customer.name ? ` (${customer.name})` : '';
+  const clientLabel = customer.name ? `Клиент (${customer.name})` : 'Клиент';
+  const selfieCaption = customer.name ? `Фото ${customer.name}` : 'Фото клиента';
+  const referenceCaption = customer.name ? `Желаемый референс ${customer.name}` : 'Желаемый референс';
 
   resetSession(phone);
 
@@ -878,7 +957,8 @@ async function handlePhotoReference(phone, session, customer, mediaId, mimeType)
       ]);
 
       const intro = `📸 Запрос оценки прически
-Клиент${nameLabel}: +${phone}`;
+${clientLabel}:
++${phone}`;
 
       await Promise.all(
         ADMIN_PHONES.map(async (adminPhone) => {
@@ -886,10 +966,10 @@ async function handlePhotoReference(phone, session, customer, mediaId, mimeType)
             const introResult = await sendTextMessage(adminPhone, intro);
             trackAdminReplyTarget(extractSentMessageId(introResult), phone, 'photo_review');
 
-            const selfieResult = await sendImageMessage(adminPhone, selfieNewId, '🧑 Фото клиента');
+            const selfieResult = await sendImageMessage(adminPhone, selfieNewId, selfieCaption);
             trackAdminReplyTarget(extractSentMessageId(selfieResult), phone, 'photo_review');
 
-            const refResult = await sendImageMessage(adminPhone, refNewId, '💇 Референс');
+            const refResult = await sendImageMessage(adminPhone, refNewId, referenceCaption);
             trackAdminReplyTarget(extractSentMessageId(refResult), phone, 'photo_review');
           } catch (err) {
             console.error(`[PhotoReview] Failed to notify admin ${adminPhone}:`, err.message);
@@ -946,6 +1026,18 @@ async function handleIncomingMessage({
     }
 
     try {
+      if (target.flow === 'photo_review' && isAffirmativeReply(trimmed)) {
+        await sendTrackedClientPrompt(
+          target.clientPhone,
+          formatPhotoReviewApprovalPrompt(),
+          'book_appointment'
+        );
+        console.log(
+          `[AdminRelay] Sent photo-review approval prompt from ${normalizedPhone} to ${target.clientPhone}`
+        );
+        return null;
+      }
+
       await sendTextMessage(target.clientPhone, formatBarberReply(trimmed));
       console.log(
         `[AdminRelay] Relayed admin reply from ${normalizedPhone} to ${target.clientPhone}`
@@ -970,6 +1062,19 @@ async function handleIncomingMessage({
 
   if (HELP_COMMANDS.includes(lower)) {
     return startHelpFlow(session);
+  }
+
+  const replyContext = getClientReplyTarget(replyToMessageId);
+  if (replyContext?.action === 'book_appointment') {
+    if (isAffirmativeReply(trimmed)) {
+      resetSession(phone);
+      return startBookingFlow(session);
+    }
+
+    if (isNegativeReply(trimmed)) {
+      resetSession(phone);
+      return buildMenuMessage();
+    }
   }
 
   switch (session.state) {
@@ -1036,4 +1141,6 @@ async function handleIncomingMessage({
 module.exports = {
   handleIncomingMessage,
   buildMenuMessage,
+  sendTrackedClientPrompt,
+  formatFollowUpPrompt,
 };
