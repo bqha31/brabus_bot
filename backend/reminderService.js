@@ -7,7 +7,9 @@
 
 const { supabase } = require('./supabase');
 const { sendTrackedClientPrompt, formatFollowUpPrompt } = require('./bookingService');
+const { sendTextMessage } = require('./whatsapp');
 
+const REMINDER_24H_LEAD_MINUTES = parseInt(process.env.REMINDER_24H_LEAD_MINUTES || '1440', 10);
 const REMINDER_LEAD_MINUTES = parseInt(process.env.REMINDER_LEAD_MINUTES || '120', 10);
 const REMINDER_WINDOW_MINUTES = parseInt(process.env.REMINDER_WINDOW_MINUTES || '15', 10);
 const REMINDER_INTERVAL_MS = parseInt(process.env.REMINDER_INTERVAL_MS || '600000', 10);
@@ -28,18 +30,20 @@ function formatReminderTime(isoString) {
   }).format(date);
 }
 
-function buildReminderMessage(serviceName, bookingTimeIso) {
+function buildReminderMessage(serviceName, barberName, bookingTimeIso, label) {
   return `🔔 Напоминание от Brabus Barbershop!
 
+${label}
 Вы записаны: ${formatReminderTime(bookingTimeIso)}
+Мастер: ${barberName}
 Услуга: ${serviceName}
 
 Ждём вас! Если планы изменились — напишите нам, чтобы отменить или перенести запись.`;
 }
 
-async function sendReminders() {
+async function sendBookingReminders({ leadMinutes, sentColumn, label, logPrefix }) {
   const now = new Date();
-  const windowStart = new Date(now.getTime() + REMINDER_LEAD_MINUTES * 60_000);
+  const windowStart = new Date(now.getTime() + leadMinutes * 60_000);
   const windowEnd = new Date(windowStart.getTime() + REMINDER_WINDOW_MINUTES * 60_000);
 
   let bookings;
@@ -47,49 +51,69 @@ async function sendReminders() {
     const { data, error } = await supabase
       .from('bookings')
       .select(
-        'id, booking_time, customer:customers(phone, name), service:services(name)'
+        'id, booking_time, customer:customers(phone, name), barber:barbers(name), service:services(name)'
       )
       .eq('status', 'confirmed')
-      .eq('reminder_sent', false)
+      .eq(sentColumn, false)
       .gte('booking_time', windowStart.toISOString())
       .lt('booking_time', windowEnd.toISOString());
 
     if (error) throw error;
     bookings = data || [];
   } catch (err) {
-    console.error('[Reminders] Failed to fetch bookings:', err.message);
+    console.error(`[${logPrefix}] Failed to fetch bookings:`, err.message);
     return;
   }
 
   if (!bookings.length) return;
 
-  console.log(`[Reminders] Sending ${bookings.length} reminder(s)...`);
+  console.log(`[${logPrefix}] Sending ${bookings.length} reminder(s)...`);
 
   for (const booking of bookings) {
     const phone = booking.customer?.phone;
     const serviceName = booking.service?.name || 'Услуга';
+    const barberName = booking.barber?.name || 'Мастер';
 
     if (!phone) {
-      console.warn(`[Reminders] Booking ${booking.id} has no phone, skipping.`);
+      console.warn(`[${logPrefix}] Booking ${booking.id} has no phone, skipping.`);
       continue;
     }
 
     try {
-      await sendTextMessage(phone, buildReminderMessage(serviceName, booking.booking_time));
+      await sendTextMessage(
+        phone,
+        buildReminderMessage(serviceName, barberName, booking.booking_time, label)
+      );
 
       const { error: updateError } = await supabase
         .from('bookings')
-        .update({ reminder_sent: true })
+        .update({ [sentColumn]: true })
         .eq('id', booking.id);
 
       if (updateError) throw updateError;
 
-      console.log(`[Reminders] Sent to ${phone} for booking ${booking.id}`);
+      console.log(`[${logPrefix}] Sent to ${phone} for booking ${booking.id}`);
     } catch (err) {
-      console.error(`[Reminders] Failed for booking ${booking.id}:`, err.message);
+      console.error(`[${logPrefix}] Failed for booking ${booking.id}:`, err.message);
       // Don't mark as sent — will retry on next interval
     }
   }
+}
+
+async function sendReminders() {
+  await sendBookingReminders({
+    leadMinutes: REMINDER_24H_LEAD_MINUTES,
+    sentColumn: 'reminder_24h_sent',
+    label: 'Напоминаем о записи за 24 часа.',
+    logPrefix: 'Reminders24h',
+  });
+
+  await sendBookingReminders({
+    leadMinutes: REMINDER_LEAD_MINUTES,
+    sentColumn: 'reminder_sent',
+    label: 'Напоминаем о записи за 2 часа.',
+    logPrefix: 'Reminders2h',
+  });
 }
 
 async function sendFollowUpReminders() {
@@ -166,7 +190,8 @@ async function runReminderJobs() {
 function startReminderScheduler() {
   console.log(
     `[Reminders] Scheduler started — checking every ${REMINDER_INTERVAL_MS / 60_000} min, ` +
-    `lead time: ${REMINDER_LEAD_MINUTES} min, follow-up window: ${FOLLOWUP_MIN_DAYS}-${FOLLOWUP_MAX_DAYS} days.`
+    `lead times: ${REMINDER_24H_LEAD_MINUTES} and ${REMINDER_LEAD_MINUTES} min, ` +
+    `follow-up window: ${FOLLOWUP_MIN_DAYS}-${FOLLOWUP_MAX_DAYS} days.`
   );
 
   // Run immediately on startup, then on each interval

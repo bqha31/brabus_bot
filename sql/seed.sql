@@ -3,6 +3,13 @@
 -- business owner. Adjust them in Supabase (table editor or SQL) if real
 -- service times differ — this directly affects how many slots fit per day.
 
+INSERT INTO barbers (name, sort_order) VALUES
+  ('Бейбарс', 1),
+  ('Досжан', 2)
+ON CONFLICT (name) DO UPDATE SET
+  sort_order = EXCLUDED.sort_order,
+  is_active = TRUE;
+
 INSERT INTO services (name, category, duration_minutes, price, sort_order) VALUES
   ('Мужская стрижка', 'individual', 45, 8000, 1),
   ('Детская стрижка (от 5 до 13 лет)', 'individual', 40, 7000, 2),

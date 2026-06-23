@@ -6,6 +6,8 @@ const sessions = new Map();
 
 const STATES = {
   MENU: 'menu',
+  BOOKING_NAME: 'booking_name',
+  BOOKING_MASTER: 'booking_master',
   BOOKING_CATEGORY: 'booking_category',
   BOOKING_SERVICE: 'booking_service',
   BOOKING_DAY: 'booking_day',
@@ -193,6 +195,14 @@ function formatPrice(price) {
   });
 }
 
+function formatPlainPrice(price) {
+  return Number(price).toLocaleString('ru-RU', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 0,
+    useGrouping: false,
+  });
+}
+
 function formatDuration(minutes) {
   if (minutes < 60) return `${minutes} мин`;
   const hours = Math.floor(minutes / 60);
@@ -232,6 +242,17 @@ function formatDateTimeFull(isoOrDate) {
     minute: '2-digit',
   });
   return formatter.format(date);
+}
+
+function formatDateNumeric(isoOrDate) {
+  const date = isoOrDate instanceof Date ? isoOrDate : new Date(isoOrDate);
+  const formatter = new Intl.DateTimeFormat('ru-RU', {
+    timeZone: getTimezone(),
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  });
+  return formatter.format(date).replace(/\./g, '-');
 }
 
 function formatDayLabel(dayOffset) {
@@ -317,6 +338,11 @@ function formatServicesForBooking(services) {
   return `Выберите услугу (напишите номер):\n\n${lines.join('\n')}\n\n0. Назад`;
 }
 
+function formatBarbersForBooking(barbers) {
+  const lines = barbers.map((b, i) => `${i + 1}. ${b.name}`);
+  return `Выберите мастера:\n\n${lines.join('\n')}\n\n0. Назад в меню`;
+}
+
 function formatDaysList() {
   const lines = [];
   for (let i = 0; i < BOOKING_DAYS_AHEAD; i += 1) {
@@ -333,31 +359,39 @@ function formatSlotsList(slots) {
   return `Свободное время:\n\n${lines.join('\n')}\n\nНапишите номер времени.\n\n0. Назад`;
 }
 
-function formatBookingConfirmation(serviceName, bookingTimeIso) {
-  return `✅ Вы записаны!
-
+function formatBookingConfirmation({ customerName, serviceName, price, barberName, bookingTimeIso }) {
+  return `${customerName}, подтверждаем запись:
+Дата: ${formatDateNumeric(bookingTimeIso)}
+Время: ${formatTime(new Date(bookingTimeIso))}
+Мастер: ${barberName}
 Услуга: ${serviceName}
-Время: ${formatDateTimeFull(bookingTimeIso)}
-📍 Адрес: Астана, Бокейхана 27/2
-2ГИС: https://2gis.kz/astana/geo/70000001083498136
+Цена: ${formatPlainPrice(price)}
+Оплата: Предпочтительно наличными
+Барбершоп Brabus
 
-Чтобы посмотреть, перенести или отменить запись — напишите «Мои записи».
+Просим обратить внимание на правила записи❗️
 
-${buildMenuMessage()}`;
+• При отмене или переносе записи менее чем за 2 часа до приёма — оплачивается 50% от стоимости услуги.
+• При отмене или переносе за 2 часа и более — оплата не требуется.
+
+https://2gis.kz/astana/geo/70000001083498136`;
 }
 
 function formatMyBookingsList(bookings) {
   const lines = bookings.map((b, i) => {
     const serviceName = b.service?.name || 'Услуга';
-    return `${i + 1}. ${serviceName} — ${formatDateTimeFull(b.booking_time)}`;
+    const barberName = b.barber?.name ? `, мастер: ${b.barber.name}` : '';
+    return `${i + 1}. ${serviceName} — ${formatDateTimeFull(b.booking_time)}${barberName}`;
   });
   return `Ваши записи:\n\n${lines.join('\n')}\n\n📍 Адрес: Астана, Бокейхана 27/2\n2ГИС: https://2gis.kz/astana/geo/70000001083498136\n\nНапишите номер записи, чтобы отменить или перенести её.\n\n0. В меню`;
 }
 
 function formatBookingActionMenu(booking) {
   const serviceName = booking.service?.name || 'Услуга';
+  const barberName = booking.barber?.name || 'Мастер';
   return `Запись: ${serviceName}
 Время: ${formatDateTimeFull(booking.booking_time)}
+Мастер: ${barberName}
 📍 Адрес: Астана, Бокейхана 27/2
 2ГИС: https://2gis.kz/astana/geo/70000001083498136
 
@@ -399,6 +433,29 @@ async function getOrCreateCustomer(phone, name) {
   return created;
 }
 
+async function updateCustomerName(customerId, name) {
+  const { data, error } = await supabase
+    .from('customers')
+    .update({ name })
+    .eq('id', customerId)
+    .select('id, phone, name')
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+async function getBarbers() {
+  const { data, error } = await supabase
+    .from('barbers')
+    .select('id, name')
+    .eq('is_active', true)
+    .order('sort_order', { ascending: true });
+
+  if (error) throw error;
+  return data || [];
+}
+
 async function getServices() {
   const { data, error } = await supabase
     .from('services')
@@ -423,11 +480,12 @@ async function getServicesByCategory(category) {
   return data || [];
 }
 
-async function getOccupiedIntervals(dayStart, dayEnd, excludeBookingId) {
+async function getOccupiedIntervals(dayStart, dayEnd, barberId, excludeBookingId) {
   let query = supabase
     .from('bookings')
     .select('id, booking_time, duration_minutes')
     .eq('status', 'confirmed')
+    .eq('barber_id', barberId)
     .gte('booking_time', dayStart.toISOString())
     .lt('booking_time', dayEnd.toISOString());
 
@@ -445,7 +503,7 @@ async function getOccupiedIntervals(dayStart, dayEnd, excludeBookingId) {
   });
 }
 
-async function getAvailableSlotsForDay(dayOffset, durationMinutes, excludeBookingId) {
+async function getAvailableSlotsForDay(dayOffset, durationMinutes, barberId, excludeBookingId) {
   const dayStart = new Date();
   dayStart.setHours(0, 0, 0, 0);
   dayStart.setDate(dayStart.getDate() + dayOffset);
@@ -453,7 +511,7 @@ async function getAvailableSlotsForDay(dayOffset, durationMinutes, excludeBookin
   const dayEnd = new Date(dayStart);
   dayEnd.setDate(dayEnd.getDate() + 1);
 
-  const occupied = await getOccupiedIntervals(dayStart, dayEnd, excludeBookingId);
+  const occupied = await getOccupiedIntervals(dayStart, dayEnd, barberId, excludeBookingId);
   const now = new Date();
   const earliestToday = new Date(now.getTime() + MIN_LEAD_MINUTES * 60000);
 
@@ -486,7 +544,7 @@ async function getAvailableSlotsForDay(dayOffset, durationMinutes, excludeBookin
 async function getMyUpcomingBookings(customerId) {
   const { data, error } = await supabase
     .from('bookings')
-    .select('id, booking_time, duration_minutes, service:services(name, price)')
+    .select('id, booking_time, duration_minutes, barber:barbers(id, name), service:services(name, price)')
     .eq('customer_id', customerId)
     .eq('status', 'confirmed')
     .gte('booking_time', new Date().toISOString())
@@ -496,12 +554,13 @@ async function getMyUpcomingBookings(customerId) {
   return data || [];
 }
 
-async function createBooking(customerId, serviceId, bookingTimeIso, durationMinutes) {
+async function createBooking(customerId, serviceId, barberId, bookingTimeIso, durationMinutes) {
   const { data, error } = await supabase
     .from('bookings')
     .insert({
       customer_id: customerId,
       service_id: serviceId,
+      barber_id: barberId,
       booking_time: bookingTimeIso,
       duration_minutes: durationMinutes,
       status: 'confirmed',
@@ -532,7 +591,11 @@ async function cancelBooking(bookingId) {
 async function rescheduleBooking(bookingId, newTimeIso) {
   const { data, error } = await supabase
     .from('bookings')
-    .update({ booking_time: newTimeIso })
+    .update({
+      booking_time: newTimeIso,
+      reminder_24h_sent: false,
+      reminder_sent: false,
+    })
     .eq('id', bookingId)
     .eq('status', 'confirmed')
     .select('id, booking_time')
@@ -634,6 +697,50 @@ async function handleViewServices() {
 // ---------- flow: booking ----------
 
 function startBookingFlow(session) {
+  session.state = STATES.BOOKING_NAME;
+  return `Как вас зовут?\n\nНапишите имя, чтобы мы указали его в подтверждении записи.\n\n0. Назад в меню`;
+}
+
+async function handleBookingNameSubmit(phone, session, customerId, text) {
+  if (text === '0') {
+    resetSession(phone);
+    return buildMenuMessage();
+  }
+
+  const name = text.trim().replace(/\s+/g, ' ');
+  if (name.length < 2) {
+    return `Пожалуйста, напишите имя полностью.\n\n0. Назад в меню`;
+  }
+
+  await updateCustomerName(customerId, name);
+  session.customerName = name;
+
+  const barbers = await getBarbers();
+  if (!barbers.length) {
+    resetSession(phone);
+    return `Сейчас нет доступных мастеров для записи. Напишите нам позже.\n\n${buildMenuMessage()}`;
+  }
+
+  session.barbers = barbers;
+  session.state = STATES.BOOKING_MASTER;
+  return formatBarbersForBooking(barbers);
+}
+
+async function handleBookingMasterChoice(phone, session, text) {
+  if (text === '0') {
+    resetSession(phone);
+    return buildMenuMessage();
+  }
+
+  const index = parseInt(text, 10) - 1;
+  const barber = session.barbers?.[index];
+
+  if (!barber) {
+    return `Выберите номер мастера из списка.\n\n${formatBarbersForBooking(session.barbers || [])}`;
+  }
+
+  session.barberId = barber.id;
+  session.barberName = barber.name;
   session.state = STATES.BOOKING_CATEGORY;
   return formatCategoryMenu();
 }
@@ -679,6 +786,7 @@ async function handleBookingServiceChoice(phone, session, text) {
   session.serviceId = service.id;
   session.serviceName = service.name;
   session.serviceDuration = service.duration_minutes;
+  session.servicePrice = service.price;
   session.state = STATES.BOOKING_DAY;
   return formatDaysList();
 }
@@ -694,7 +802,7 @@ async function handleBookingDayChoice(phone, session, text) {
     return `Пожалуйста, выберите день из списка.\n\n${formatDaysList()}`;
   }
 
-  const slots = await getAvailableSlotsForDay(dayOffset, session.serviceDuration);
+  const slots = await getAvailableSlotsForDay(dayOffset, session.serviceDuration, session.barberId);
   if (!slots.length) {
     return `На этот день свободного времени нет. Выберите другой день.\n\n${formatDaysList()}`;
   }
@@ -718,10 +826,20 @@ async function handleBookingSlotChoice(phone, session, customerId, text) {
     return `Выберите номер времени из списка.\n\n${formatSlotsList(session.slots || [])}`;
   }
 
-  const result = await createBooking(customerId, session.serviceId, slot.iso, session.serviceDuration);
+  const result = await createBooking(
+    customerId,
+    session.serviceId,
+    session.barberId,
+    slot.iso,
+    session.serviceDuration
+  );
 
   if (result.error) {
-    session.slots = await getAvailableSlotsForDay(session.dayOffset, session.serviceDuration);
+    session.slots = await getAvailableSlotsForDay(
+      session.dayOffset,
+      session.serviceDuration,
+      session.barberId
+    );
     if (!session.slots.length) {
       resetSession(phone);
       return `${result.error}\n\nК сожалению, на этот день больше нет свободного времени.\n\n${buildMenuMessage()}`;
@@ -730,11 +848,26 @@ async function handleBookingSlotChoice(phone, session, customerId, text) {
   }
 
   const serviceName = session.serviceName;
+  const servicePrice = session.servicePrice;
+  const barberName = session.barberName;
+  const customerName = session.customerName || 'Клиент';
   resetSession(phone);
 
-  notifyAdmins(`🆕 Новая запись\nУслуга: ${serviceName}\nВремя: ${formatDateTimeFull(slot.iso)}`);
+  notifyAdmins(
+    `🆕 Новая запись
+Клиент: ${customerName}
+Мастер: ${barberName}
+Услуга: ${serviceName}
+Время: ${formatDateTimeFull(slot.iso)}`
+  );
 
-  return formatBookingConfirmation(serviceName, slot.iso);
+  return formatBookingConfirmation({
+    customerName,
+    serviceName,
+    price: servicePrice,
+    barberName,
+    bookingTimeIso: slot.iso,
+  });
 }
 
 // ---------- flow: my bookings ----------
@@ -806,7 +939,10 @@ async function handleCancelConfirmChoice(phone, session, text) {
     resetSession(phone);
 
     notifyAdmins(
-      `❌ Отмена записи\nУслуга: ${booking.service?.name || ''}\nВремя: ${formatDateTimeFull(booking.booking_time)}`
+      `❌ Отмена записи
+Мастер: ${booking.barber?.name || 'Мастер'}
+Услуга: ${booking.service?.name || ''}
+Время: ${formatDateTimeFull(booking.booking_time)}`
     );
 
     await sendTrackedClientPrompt(phone, formatCancelRecoveryPrompt(), 'book_appointment');
@@ -828,7 +964,12 @@ async function handleRescheduleDayChoice(phone, session, text) {
   }
 
   const booking = session.selectedBooking;
-  const slots = await getAvailableSlotsForDay(dayOffset, booking.duration_minutes, booking.id);
+  const slots = await getAvailableSlotsForDay(
+    dayOffset,
+    booking.duration_minutes,
+    booking.barber?.id,
+    booking.id
+  );
 
   if (!slots.length) {
     return `На этот день свободного времени нет. Выберите другой день.\n\n${formatDaysList()}`;
@@ -857,7 +998,12 @@ async function handleRescheduleSlotChoice(phone, session, text) {
   const result = await rescheduleBooking(booking.id, slot.iso);
 
   if (result.error) {
-    session.slots = await getAvailableSlotsForDay(session.dayOffset, booking.duration_minutes, booking.id);
+    session.slots = await getAvailableSlotsForDay(
+      session.dayOffset,
+      booking.duration_minutes,
+      booking.barber?.id,
+      booking.id
+    );
     if (!session.slots.length) {
       resetSession(phone);
       return `${result.error}\n\nК сожалению, на этот день больше нет свободного времени.\n\n${buildMenuMessage()}`;
@@ -868,7 +1014,12 @@ async function handleRescheduleSlotChoice(phone, session, text) {
   const serviceName = booking.service?.name || 'Услуга';
   resetSession(phone);
 
-  notifyAdmins(`🔁 Перенос записи\nУслуга: ${serviceName}\nНовое время: ${formatDateTimeFull(slot.iso)}`);
+  notifyAdmins(
+    `🔁 Перенос записи
+Мастер: ${booking.barber?.name || 'Мастер'}
+Услуга: ${serviceName}
+Новое время: ${formatDateTimeFull(slot.iso)}`
+  );
 
   return `✅ Запись перенесена на ${formatDateTimeFull(slot.iso)}.\n📍 Адрес: Астана, Бокейхана 27/2\n2ГИС: https://2gis.kz/astana/geo/70000001083498136\n\n${buildMenuMessage()}`;
 }
@@ -1078,6 +1229,10 @@ async function handleIncomingMessage({
   }
 
   switch (session.state) {
+    case STATES.BOOKING_NAME:
+      return handleBookingNameSubmit(phone, session, customer.id, trimmed);
+    case STATES.BOOKING_MASTER:
+      return handleBookingMasterChoice(phone, session, trimmed);
     case STATES.BOOKING_CATEGORY:
       return handleBookingCategoryChoice(phone, session, trimmed);
     case STATES.BOOKING_SERVICE:
